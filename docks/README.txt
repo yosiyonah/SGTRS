@@ -1,0 +1,1 @@
+This folder holds lightweight docs: the high-level plan, parking lot, and decisions.
