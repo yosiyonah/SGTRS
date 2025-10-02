@@ -1,9 +1,9 @@
 from __future__ import annotations
 import argparse, os
 from datetime import date, timedelta
-import requests
 import pandas as pd
-from dotenv import load_dotenv
+import requests
+from dotenv import find_dotenv, load_dotenv
 
 
 from common.io import bronze_partition_path, write_parquet
@@ -12,17 +12,6 @@ from common.lineage import make_run_id
 
 
 TIINGO_API = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
-
-
-
-
-def daterange(d1: date, d2: date):
-    # inclusive range [d1, d2]
-    cur = d1
-    while cur <= d2:
-        yield cur
-        cur += timedelta(days=1)
-
 
 
 
@@ -35,7 +24,6 @@ def fetch_tiingo_eod(ticker: str, start: str, end: str, token: str) -> pd.DataFr
     if not data:
         return pd.DataFrame()
     df = pd.DataFrame(data)
-    # Tiingo fields include: date, open, high, low, close, adjClose, volume, etc.
     df["ticker"] = ticker
     return df
 
@@ -43,41 +31,54 @@ def fetch_tiingo_eod(ticker: str, start: str, end: str, token: str) -> pd.DataFr
 
 
 def main():
-    load_dotenv()
-    parser = argparse.ArgumentParser(description="Fetch Tiingo EOD prices into Bronze partitions")
+    # Locate .env even if cwd isn't repo root
+    load_dotenv(find_dotenv())
+
+    parser = argparse.ArgumentParser(
+        description="Fetch Tiingo EOD prices into Bronze partitions (one file per date)"
+    )
     parser.add_argument("--from", dest="from_", required=True, help="YYYY-MM-DD")
     parser.add_argument("--to", dest="to", required=True, help="YYYY-MM-DD")
     parser.add_argument("--tickers", required=True, help="Comma-separated tickers")
     args = parser.parse_args()
 
 
-token = os.getenv("TIINGO_API_KEY")
-if not token:
-    raise SystemExit("Missing TIINGO_API_KEY in .env")
+    token = os.getenv("TIINGO_API_KEY")
+    if not token:
+        raise SystemExit("Missing TIINGO_API_KEY in .env")
 
 
-run_id = make_run_id()
-tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    run_id = make_run_id()
+    tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
 
 
-# Fetch once per ticker for the whole window, then write one part per date
-for tkr in tickers:
-    df = fetch_tiingo_eod(tkr, args.from_, args.to, token)
-    if df.empty:
-        print(f"No data for {tkr} in range {args.from_}..{args.to}")
-        continue
-    # Normalize date to YYYY-MM-DD
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    df["source"] = "tiingo"
-    df["ingest_ts_utc"] = utc_now_iso()
-    df["ingest_run_id"] = run_id
+    # Fetch each ticker once for the full window, then write one parquet per date containing all rows
+    frames: list[pd.DataFrame] = []
+    for tkr in tickers:
+        df = fetch_tiingo_eod(tkr, args.from_, args.to, token)
+        if df.empty:
+            print(f"No data for {tkr} in range {args.from_}..{args.to}")
+            continue
+        frames.append(df)
 
 
-    for d in sorted(df["date"].unique()):
-        part_df = df[df["date"] == d].copy()
-        path = bronze_partition_path("equities", "tiingo", "prices_eod", d, part=tkr)
-        write_parquet(part_df, path)
-        print(f"Wrote {len(part_df)} rows -> {path}")
+    if not frames:
+        print("No data fetched for any ticker — nothing to write.")
+        return
+
+
+    big = pd.concat(frames, ignore_index=True)
+    big["date"] = pd.to_datetime(big["date"]).dt.strftime("%Y-%m-%d")
+    big["source"] = "tiingo"
+    big["ingest_ts_utc"] = utc_now_iso()
+    big["ingest_run_id"] = run_id
+
+
+    # Write one file per date (cuts small-file count drastically)
+    for d, g in big.groupby("date", sort=True):
+        path = bronze_partition_path("equities", "tiingo", "prices_eod", d, part="0000")
+        write_parquet(g, path)  # overwrites if exists
+        print(f"Wrote {len(g)} rows -> {path}")
 
 
 if __name__ == "__main__":
